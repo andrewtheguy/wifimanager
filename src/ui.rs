@@ -141,11 +141,6 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    // Name the pane Tab moves to, so the arrow keys are never a guess.
-    let tab_hint = match app.focus {
-        Focus::Devices => "tab → networks",
-        Focus::Networks => "tab → devices",
-    };
     let keys: &[(&str, &str)] = &[
         ("↵", "join"),
         ("s", "scan"),
@@ -169,10 +164,6 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(FG_DIM),
         ));
     }
-    spans.push(Span::styled(
-        tab_hint.to_string(),
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-    ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
