@@ -1,3 +1,159 @@
-fn main() {
-    println!("Hello, world!");
+//! A terminal Wi-Fi manager for NetworkManager, driving its D-Bus API directly.
+
+mod app;
+mod nm;
+mod ui;
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Result;
+use crossterm::event::EventStream;
+use futures_util::StreamExt;
+use tokio::sync::mpsc;
+use zbus::message::Type as MessageType;
+use zbus::{MatchRule, MessageStream};
+
+use app::{App, Msg, Status};
+use nm::NmClient;
+
+/// Fall back to a poll at this interval when the bus is quiet.
+const IDLE_REFRESH: Duration = Duration::from_secs(2);
+/// Floor between refreshes, so a burst of signals cannot spin the client.
+const MIN_REFRESH_GAP: Duration = Duration::from_millis(400);
+/// Let a burst settle before reading, so we snapshot a consistent state.
+const DEBOUNCE: Duration = Duration::from_millis(120);
+
+const USAGE: &str = "\
+wifimanager — a terminal Wi-Fi manager for NetworkManager
+
+usage: wifimanager
+
+Talks to NetworkManager over D-Bus. Takes no options; press ? inside for keys.
+Changing anything (joining, scanning, toggling the radio) goes through polkit,
+so run it from a local login session or as root.";
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    match std::env::args().nth(1).as_deref() {
+        None => {}
+        Some("-h" | "--help") => {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        Some("-V" | "--version") => {
+            println!("wifimanager {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some(other) => {
+            eprintln!("wifimanager: unexpected argument `{other}`\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    }
+
+    let client = match NmClient::new().await {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            eprintln!("wifimanager: {}", app::format_error(&e));
+            eprintln!("is NetworkManager running? (systemctl status NetworkManager)");
+            std::process::exit(1);
+        }
+    };
+
+    let (tx, mut rx) = mpsc::channel::<Msg>(64);
+    let (poke_tx, poke_rx) = mpsc::channel::<()>(8);
+
+    tokio::spawn(refresher(client.clone(), tx.clone(), poke_rx));
+
+    let mut app = App::new(client, tx, poke_tx);
+    let mut terminal = ratatui::init();
+    let mut events = EventStream::new();
+
+    let result = loop {
+        if let Err(e) = terminal.draw(|f| ui::draw(f, &app)) {
+            break Err(e.into());
+        }
+        if app.quit {
+            break Ok(());
+        }
+
+        tokio::select! {
+            ev = events.next() => match ev {
+                Some(Ok(ev)) => app.on_event(ev),
+                Some(Err(e)) => break Err(e.into()),
+                None => break Ok(()),
+            },
+            msg = rx.recv() => match msg {
+                Some(msg) => app.on_msg(msg),
+                None => break Ok(()),
+            },
+            // Keeps the spinner turning and ages out stale status messages.
+            _ = tokio::time::sleep(Duration::from_millis(120)) => {}
+        }
+    };
+
+    ratatui::restore();
+    result
+}
+
+/// Publishes snapshots of NetworkManager's state to the UI.
+///
+/// NetworkManager announces everything we care about — radio toggles, device
+/// state changes, access points coming and going, signal strength — as signals,
+/// so refreshes are driven by the bus rather than by a fixed poll; the timer is
+/// only a safety net.
+async fn refresher(client: Arc<NmClient>, tx: mpsc::Sender<Msg>, mut poke: mpsc::Receiver<()>) {
+    let (wake_tx, mut wake_rx) = mpsc::channel::<()>(1);
+    tokio::spawn(watch_signals(client.clone(), wake_tx));
+
+    loop {
+        let started = tokio::time::Instant::now();
+        match client.snapshot().await {
+            Ok(snap) => {
+                if tx.send(Msg::Snapshot(Box::new(snap))).await.is_err() {
+                    return;
+                }
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(Msg::Status(Status::error(app::format_error(&e))))
+                    .await;
+            }
+        }
+
+        tokio::select! {
+            _ = poke.recv() => {}
+            _ = wake_rx.recv() => {}
+            _ = tokio::time::sleep(IDLE_REFRESH) => {}
+        }
+
+        // Let a burst settle, and keep a floor under the refresh rate: a busy
+        // radio can produce signals faster than a snapshot takes to read.
+        tokio::time::sleep(DEBOUNCE).await;
+        tokio::time::sleep_until(started + MIN_REFRESH_GAP).await;
+    }
+}
+
+/// Collapse NetworkManager's signal traffic into a single wake-up.
+///
+/// This has to run in its own task and consume messages as fast as they arrive.
+/// A `MessageStream` that is left unread back-pressures the shared connection,
+/// which stalls the replies to our own method calls — and NetworkManager is
+/// chatty enough to fill the queue in well under a second, because every access
+/// point in range reports its signal strength as it changes.
+async fn watch_signals(client: Arc<NmClient>, wake: mpsc::Sender<()>) {
+    let rule = MatchRule::builder()
+        .msg_type(MessageType::Signal)
+        .sender("org.freedesktop.NetworkManager")
+        .expect("valid bus name")
+        .build();
+    let Ok(mut signals) = MessageStream::for_match_rule(rule, client.connection(), Some(64)).await
+    else {
+        return;
+    };
+    while signals.next().await.is_some() {
+        // A full channel already means "refresh pending", so dropping the
+        // notification is exactly right.
+        let _ = wake.try_send(());
+    }
 }
