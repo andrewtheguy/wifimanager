@@ -106,18 +106,25 @@ async fn refresher(client: Arc<NmClient>, tx: mpsc::Sender<Msg>, mut poke: mpsc:
     let (wake_tx, mut wake_rx) = mpsc::channel::<()>(1);
     tokio::spawn(watch_signals(client.clone(), wake_tx));
 
+    // A bus that is down fails every refresh; reporting the same sentence twice
+    // a second only costs the user the status message they were reading.
+    let mut last_error: Option<String> = None;
+
     loop {
         let started = tokio::time::Instant::now();
         match client.snapshot().await {
             Ok(snap) => {
+                last_error = None;
                 if tx.send(Msg::Snapshot(Box::new(snap))).await.is_err() {
                     return;
                 }
             }
             Err(e) => {
-                let _ = tx
-                    .send(Msg::Status(Status::error(app::format_error(&e))))
-                    .await;
+                let text = app::format_error(&e);
+                if last_error.as_deref() != Some(text.as_str()) {
+                    last_error = Some(text.clone());
+                    let _ = tx.send(Msg::Status(Status::error(text))).await;
+                }
             }
         }
 
