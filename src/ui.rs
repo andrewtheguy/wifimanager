@@ -18,6 +18,7 @@ const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '�
 const FG_DIM: Color = Color::DarkGray;
 const FG_KEY: Color = Color::Gray;
 const ACCENT: Color = Color::Cyan;
+const BG_DEEP: Color = Color::Rgb(16, 18, 22);
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let [header, body, footer] = Layout::vertical([
@@ -53,24 +54,28 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
 // ---------------------------------------------------------------------- chrome
 
+/// A bordered pane. The focused one is meant to be obvious across the room:
+/// a heavy accent border and a reversed title chip, against a thin dim border
+/// and plain title for everything else.
 fn panel(title: impl Into<String>, focused: bool) -> Block<'static> {
-    let style = if focused {
-        Style::default().fg(ACCENT)
+    let (border_type, border_style, title_style) = if focused {
+        (
+            BorderType::Thick,
+            Style::default().fg(ACCENT),
+            Style::default().fg(BG_DEEP).bg(ACCENT).add_modifier(Modifier::BOLD),
+        )
     } else {
-        Style::default().fg(FG_DIM)
+        (
+            BorderType::Rounded,
+            Style::default().fg(FG_DIM),
+            Style::default().fg(FG_KEY),
+        )
     };
     Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(style)
-        .title(Span::styled(
-            format!(" {} ", title.into()),
-            if focused {
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(FG_KEY)
-            },
-        ))
+        .border_type(border_type)
+        .border_style(border_style)
+        .title(Span::styled(format!(" {} ", title.into()), title_style))
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
@@ -136,6 +141,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
+    // Name the pane Tab moves to, so the arrow keys are never a guess.
+    let tab_hint = match app.focus {
+        Focus::Devices => "tab → networks",
+        Focus::Networks => "tab → devices",
+    };
     let keys: &[(&str, &str)] = &[
         ("↵", "join"),
         ("s", "scan"),
@@ -146,7 +156,6 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         ("n", "hidden"),
         ("a", "autoconnect"),
         ("m", "managed"),
-        ("tab", "pane"),
         ("q", "quit"),
     ];
     let mut spans = vec![Span::raw(" ")];
@@ -160,6 +169,10 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(FG_DIM),
         ));
     }
+    spans.push(Span::styled(
+        tab_hint.to_string(),
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -189,7 +202,7 @@ fn draw_devices(frame: &mut Frame, area: Rect, app: &App) {
         List::new(items)
             .block(block)
             .highlight_style(selection_style(focused))
-            .highlight_symbol(""),
+            .highlight_symbol(selection_marker(focused)),
         area,
         &mut state,
     );
@@ -204,7 +217,7 @@ fn device_row(d: &WifiDevice) -> ListItem<'static> {
         ),
         Span::raw(" "),
         Span::styled(
-            format!("{:<11}", truncate(&d.interface, 11)),
+            format!("{:<16}", truncate(&d.interface, 16)),
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::styled(d.state.to_string(), Style::default().fg(color)),
@@ -215,11 +228,11 @@ fn device_row(d: &WifiDevice) -> ListItem<'static> {
     let detail = if let Some(net) = d.active_network() {
         format!(
             "{} · {}%",
-            truncate(&display_name(net), 18),
+            truncate(&display_name(net), 22),
             net.strength()
         )
     } else if let Some(a) = &d.active {
-        truncate(&a.id, 26)
+        truncate(&a.id, 30)
     } else if !d.managed {
         "not managed by NetworkManager".into()
     } else if d.state_reason != 0 {
@@ -369,7 +382,7 @@ fn draw_networks(frame: &mut Frame, area: Rect, app: &App) {
         List::new(items)
             .block(block)
             .highlight_style(selection_style(focused))
-            .highlight_symbol(""),
+            .highlight_symbol(selection_marker(focused)),
         area,
         &mut state,
     );
@@ -743,12 +756,20 @@ fn device_color(state: DeviceState) -> Color {
     }
 }
 
+/// The cursor row. In the unfocused pane it stays visible — it is still where
+/// the cursor will be on the next Tab — but faint enough not to compete.
 fn selection_style(focused: bool) -> Style {
     if focused {
         Style::default().bg(Color::Rgb(38, 48, 60)).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().bg(Color::Rgb(28, 32, 38))
+        Style::default().bg(Color::Rgb(24, 26, 30))
     }
+}
+
+/// Left gutter marker on the cursor row, drawn only in the focused pane. The
+/// blank keeps both panes on the same column grid so nothing shifts on Tab.
+fn selection_marker(focused: bool) -> &'static str {
+    if focused { "\u{258c}" } else { " " }
 }
 
 fn yes_no(v: bool) -> &'static str {
