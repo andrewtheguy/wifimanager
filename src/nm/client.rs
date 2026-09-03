@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use futures_util::future::join_all;
 use zbus::Connection;
 use zbus::proxy::CacheProperties;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
@@ -210,12 +211,15 @@ impl NmClient {
 
         let active_ap = w.path("ActiveAccessPoint");
 
-        let mut aps = Vec::new();
-        for ap_path in w.paths("AccessPoints") {
-            if let Ok(ap) = self.read_ap(&ap_path).await {
-                aps.push(ap);
-            }
-        }
+        // One round trip per access point, in flight together: a busy band can
+        // carry a hundred of them, and walking the list serially is what makes a
+        // refresh visibly lag behind the radio.
+        let ap_paths = w.paths("AccessPoints");
+        let aps: Vec<AccessPoint> = join_all(ap_paths.iter().map(|p| self.read_ap(p)))
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
 
         let networks = aggregate(aps, active_ap.as_ref(), saved, &d.string("Interface"));
 
@@ -402,11 +406,14 @@ impl NmClient {
 
     pub async fn request_scan(&self, device: &OwnedObjectPath) -> Result<()> {
         let proxy = self.wireless(device).await?;
+        // A failed read is "unknown", not a value: -1 is what NetworkManager
+        // itself reports for a device that has never scanned, so folding the two
+        // together would let a one-off read error read as a finished scan.
         let before = self
             .get_all(&device.as_ref(), IFACE_WIRELESS)
             .await
             .map(|p| p.i64("LastScan"))
-            .unwrap_or(-1);
+            .ok();
         proxy
             .request_scan(HashMap::new())
             .await
@@ -420,8 +427,10 @@ impl NmClient {
                 .get_all(&device.as_ref(), IFACE_WIRELESS)
                 .await
                 .map(|p| p.i64("LastScan"))
-                .unwrap_or(-1);
-            if now != before {
+                .ok();
+            if let (Some(before), Some(now)) = (before, now)
+                && now != before
+            {
                 return Ok(());
             }
         }
@@ -527,7 +536,7 @@ impl NmClient {
             .collect();
         settings.remove("802-11-wireless-security");
         settings.remove("802-1x");
-        for (group, values) in security_settings(security, secret) {
+        for (group, values) in security_settings(security, secret)? {
             settings.insert(group, values);
         }
         proxy
@@ -662,7 +671,7 @@ pub fn build_wifi_profile(
     secret: &Secret,
     hidden: bool,
     interface: &str,
-) -> ConnSettings {
+) -> Result<ConnSettings> {
     let mut settings: ConnSettings = HashMap::new();
 
     let mut connection: HashMap<String, Value<'static>> = HashMap::new();
@@ -680,7 +689,7 @@ pub fn build_wifi_profile(
     }
     settings.insert("802-11-wireless".into(), wireless);
 
-    for (group, values) in security_settings(security, secret) {
+    for (group, values) in security_settings(security, secret)? {
         settings.insert(group, values);
     }
 
@@ -693,18 +702,18 @@ pub fn build_wifi_profile(
         HashMap::from([("method".to_string(), Value::from("auto"))]),
     );
 
-    settings
+    Ok(settings)
 }
 
 fn security_settings(
     security: Security,
     secret: &Secret,
-) -> Vec<(String, HashMap<String, Value<'static>>)> {
+) -> Result<Vec<(String, HashMap<String, Value<'static>>)>> {
     let mut out: Vec<(String, HashMap<String, Value<'static>>)> = Vec::new();
     let mut sec: HashMap<String, Value<'static>> = HashMap::new();
 
     match (security, secret) {
-        (Security::Open, _) => return out,
+        (Security::Open, _) => return Ok(out),
         (Security::Owe, _) => {
             sec.insert("key-mgmt".into(), Value::from("owe"));
         }
@@ -739,13 +748,15 @@ fn security_settings(
             ]);
             out.push(("802-1x".into(), eap));
         }
-        // Mismatched secret kinds cannot happen from the UI, but fall back to
-        // an unsecured profile rather than writing a half-formed one.
-        _ => return out,
+        // Dropping a secret of the wrong shape would hand a secured SSID a
+        // profile with no security group at all, which NetworkManager would
+        // happily store and then fail to associate with. Say what is missing.
+        (Security::Enterprise, _) => bail!("802.1X needs an identity and a password"),
+        _ => bail!("{security} needs a passphrase"),
     }
 
     out.push(("802-11-wireless-security".into(), sec));
-    out
+    Ok(out)
 }
 
 /// Which stored profile should we prefer when joining `network`?
@@ -866,7 +877,8 @@ mod tests {
             &Secret::Passphrase("hunter2".into()),
             false,
             "wlan0",
-        );
+        )
+        .unwrap();
         assert_eq!(
             profile["connection"]["type"],
             Value::from("802-11-wireless")
@@ -880,7 +892,8 @@ mod tests {
 
     #[test]
     fn a_hidden_open_profile_has_no_security_group() {
-        let profile = build_wifi_profile(b"lab", Security::Open, &Secret::None, true, "wlan0");
+        let profile =
+            build_wifi_profile(b"lab", Security::Open, &Secret::None, true, "wlan0").unwrap();
         assert_eq!(profile["802-11-wireless"]["hidden"], Value::from(true));
         assert!(!profile.contains_key("802-11-wireless-security"));
     }
@@ -893,7 +906,8 @@ mod tests {
             &Secret::Passphrase("0123456789".into()),
             false,
             "wlan0",
-        );
+        )
+        .unwrap();
         assert_eq!(
             hex["802-11-wireless-security"]["wep-key-type"],
             Value::from(1u32)
@@ -904,10 +918,29 @@ mod tests {
             &Secret::Passphrase("open sesame".into()),
             false,
             "wlan0",
-        );
+        )
+        .unwrap();
         assert_eq!(
             phrase["802-11-wireless-security"]["wep-key-type"],
             Value::from(2u32)
+        );
+    }
+
+    #[test]
+    fn a_secured_network_never_yields_a_profile_without_a_security_group() {
+        let err = build_wifi_profile(b"home", Security::WpaPsk, &Secret::None, false, "wlan0")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "WPA2 needs a passphrase");
+        assert!(
+            build_wifi_profile(
+                b"campus",
+                Security::Enterprise,
+                &Secret::Passphrase("pw".into()),
+                false,
+                "wlan0",
+            )
+            .is_err()
         );
     }
 
@@ -922,7 +955,8 @@ mod tests {
             },
             false,
             "wlan0",
-        );
+        )
+        .unwrap();
         assert_eq!(
             profile["802-11-wireless-security"]["key-mgmt"],
             Value::from("wpa-eap")

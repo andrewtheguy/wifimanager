@@ -358,7 +358,7 @@ impl App {
 
     fn on_key_confirm(&mut self, key: KeyEvent, c: ConfirmKind) {
         match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => match c {
+            KeyCode::Char('y') | KeyCode::Char('Y') => match c {
                 ConfirmKind::Forget { name, connections } => {
                     let client = self.client.clone();
                     self.spawn(
@@ -492,6 +492,7 @@ impl App {
         let security = net.security();
         let ap = Some(net.best().path.clone());
         let name = display_name(net);
+        let ssid = net.ssid.clone();
         let saved = preferred_saved(net).cloned();
 
         // Ask for a secret when there is no stored profile to lean on, or when
@@ -512,7 +513,7 @@ impl App {
                     PromptKind::Join {
                         device,
                         interface,
-                        ssid: net.ssid.clone(),
+                        ssid: ssid.clone(),
                         security,
                         ap,
                     },
@@ -535,7 +536,13 @@ impl App {
             }
             None => {
                 let profile =
-                    build_wifi_profile(&net.ssid, security, &Secret::None, false, &interface);
+                    match build_wifi_profile(&ssid, security, &Secret::None, false, &interface) {
+                        Ok(profile) => profile,
+                        Err(e) => {
+                            self.set_status(Status::error(format_error(&e)));
+                            return;
+                        }
+                    };
                 self.spawn(pending.as_str(), done, async move {
                     let active = client.add_and_activate(profile, &device, ap.as_ref()).await?;
                     client.wait_for_activation(&active, &device).await
@@ -574,7 +581,13 @@ impl App {
                     return;
                 };
                 let name = crate::nm::ssid_to_string(&ssid);
-                let profile = build_wifi_profile(&ssid, security, &secret, false, &interface);
+                let profile = match build_wifi_profile(&ssid, security, &secret, false, &interface) {
+                    Ok(profile) => profile,
+                    Err(e) => {
+                        self.modal = Modal::Prompt(reject(p, &format_error(&e)));
+                        return;
+                    }
+                };
                 self.spawn(
                     format!("connecting to {name}…").as_str(),
                     format!("connected to {name}"),
@@ -608,7 +621,13 @@ impl App {
                     (Security::WpaPsk, Secret::Passphrase(password))
                 };
                 let profile =
-                    build_wifi_profile(ssid.as_bytes(), security, &secret, true, &interface);
+                    match build_wifi_profile(ssid.as_bytes(), security, &secret, true, &interface) {
+                        Ok(profile) => profile,
+                        Err(e) => {
+                            self.modal = Modal::Prompt(reject(p, &format_error(&e)));
+                            return;
+                        }
+                    };
                 let name = ssid.clone();
                 self.spawn(
                     format!("connecting to {name}…").as_str(),
