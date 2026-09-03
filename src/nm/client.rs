@@ -9,6 +9,7 @@ use zbus::Connection;
 use zbus::proxy::CacheProperties;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
+use super::conf;
 use super::proxies::*;
 use super::types::*;
 
@@ -227,6 +228,7 @@ impl NmClient {
         Ok(Some(WifiDevice {
             path: path.clone(),
             model: device_model(&interface),
+            disabled_by_config: conf::is_disabled(&interface),
             interface,
             driver: d.string("Driver"),
             driver_version: d.string("DriverVersion"),
@@ -457,13 +459,62 @@ impl NmClient {
         Ok(())
     }
 
-    pub async fn set_device_managed(&self, device: &OwnedObjectPath, on: bool) -> Result<()> {
+    /// Hand the device back to NetworkManager, now and at every boot.
+    pub async fn enable_device(&self, device: &OwnedObjectPath, interface: &str) -> Result<()> {
+        conf::remove_disabled(interface)?;
+        self.reload_config().await?;
         self.device(device)
             .await?
-            .set_managed(on)
+            .set_managed(true)
             .await
-            .context("setting device managed")?;
+            .context("setting the device managed")?;
+        self.wait_for_managed(device, true).await
+    }
+
+    /// Take the device away from NetworkManager, now and at every boot. The
+    /// drop-in goes first: it is the step that needs root, so a run without it
+    /// fails before anything has changed.
+    pub async fn disable_device(&self, device: &OwnedObjectPath, interface: &str) -> Result<()> {
+        conf::write_disabled(interface)?;
+        self.reload_config().await?;
+        self.device(device)
+            .await?
+            .set_managed(false)
+            .await
+            .context("setting the device unmanaged")?;
+        self.wait_for_managed(device, false).await?;
+        // NetworkManager leaves the link up when it lets go; down is where a
+        // reboot would leave it, and an up radio is not an idle one.
+        crate::link::set_down(interface)
+    }
+
+    /// Re-read the configuration files, so a device that turns up later — a
+    /// replugged USB adapter — is judged by the drop-in as it is on disk.
+    async fn reload_config(&self) -> Result<()> {
+        self.manager
+            .reload(1)
+            .await
+            .context("reloading the NetworkManager configuration")?;
         Ok(())
+    }
+
+    /// Setting `Managed` is a request; the device state is what says it was
+    /// carried out.
+    async fn wait_for_managed(&self, device: &OwnedObjectPath, managed: bool) -> Result<()> {
+        for _ in 0..20 {
+            let state = self
+                .get_all(&device.as_ref(), IFACE_DEVICE)
+                .await
+                .map(|d| DeviceState::from(d.u32("State")))?;
+            if (state != DeviceState::Unmanaged) == managed {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        bail!(
+            "NetworkManager did not {} the device within 5s",
+            if managed { "take over" } else { "release" }
+        )
     }
 
     pub async fn forget(&self, connection: &OwnedObjectPath) -> Result<()> {

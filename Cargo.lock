@@ -1922,6 +1922,7 @@ dependencies = [
  "anyhow",
  "crossterm",
  "futures-util",
+ "libc",
  "ratatui",
  "tokio",
  "zbus",

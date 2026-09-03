@@ -95,6 +95,14 @@ pub struct Prompt {
 #[derive(Debug, Clone)]
 pub enum ConfirmKind {
     Forget { name: String, connections: Vec<OwnedObjectPath> },
+    /// Disabling outlives the session, so it is the one device action that
+    /// asks first.
+    Disable {
+        device: OwnedObjectPath,
+        interface: String,
+        /// The profile the device is carrying, if any.
+        carrying: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -328,7 +336,7 @@ impl App {
             KeyCode::Char('d') => self.disconnect(),
             KeyCode::Char('f') => self.forget(),
             KeyCode::Char('a') => self.toggle_device_autoconnect(),
-            KeyCode::Char('m') => self.toggle_device_managed(),
+            KeyCode::Char('e') => self.toggle_device_enabled(),
             _ => {}
         }
     }
@@ -372,6 +380,14 @@ impl App {
                         },
                     );
                 }
+                ConfirmKind::Disable { device, interface, .. } => {
+                    let client = self.client.clone();
+                    self.spawn(
+                        format!("disabling {interface}…").as_str(),
+                        format!("{interface} disabled"),
+                        async move { client.disable_device(&device, &interface).await },
+                    );
+                }
             },
             _ => {}
         }
@@ -402,6 +418,13 @@ impl App {
         };
         if !self.snapshot.wireless_enabled {
             self.set_status(Status::error("Wi-Fi is off — press w to enable it"));
+            return;
+        }
+        if !dev.enabled() {
+            self.set_status(Status::error(format!(
+                "{} is disabled — press e to enable it",
+                dev.interface
+            )));
             return;
         }
         let (path, iface) = (dev.path.clone(), dev.interface.clone());
@@ -439,14 +462,24 @@ impl App {
         );
     }
 
-    fn toggle_device_managed(&mut self) {
+    /// Enable takes effect at once; disable is confirmed first because it
+    /// holds across reboots.
+    fn toggle_device_enabled(&mut self) {
         let Some(dev) = self.device() else { return };
-        let (path, iface, on) = (dev.path.clone(), dev.interface.clone(), !dev.managed);
+        let (device, interface) = (dev.path.clone(), dev.interface.clone());
+        if dev.enabled() {
+            self.modal = Modal::Confirm(ConfirmKind::Disable {
+                device,
+                interface,
+                carrying: dev.active.as_ref().map(|a| a.id.clone()),
+            });
+            return;
+        }
         let client = self.client.clone();
         self.spawn(
-            "updating device…",
-            format!("{iface} is now {}", if on { "managed" } else { "unmanaged" }),
-            async move { client.set_device_managed(&path, on).await },
+            format!("enabling {interface}…").as_str(),
+            format!("{interface} enabled"),
+            async move { client.enable_device(&device, &interface).await },
         );
     }
 
@@ -722,8 +755,11 @@ pub fn format_error(e: &anyhow::Error) -> String {
     }
     // polkit is the usual reason a change is refused, and the fix is not
     // something the message itself ever mentions.
-    if msg.to_lowercase().contains("not authorized") {
+    let lower = msg.to_lowercase();
+    if lower.contains("not authorized") {
         msg.push_str("  — needs a local login session or root");
+    } else if lower.contains("permission denied") || lower.contains("not permitted") {
+        msg.push_str("  — needs root");
     }
     msg
 }
@@ -744,6 +780,17 @@ mod tests {
                 "requesting a scan: wifi.scan request failed: not authorized",
                 "  — needs a local login session or root"
             )
+        );
+    }
+
+    #[test]
+    fn a_refused_file_write_points_at_root() {
+        let e = anyhow::Error::from(std::io::Error::from_raw_os_error(13))
+            .context("writing /etc/NetworkManager/conf.d/90-wifimanager-wlan0.conf");
+        assert_eq!(
+            format_error(&e),
+            "writing /etc/NetworkManager/conf.d/90-wifimanager-wlan0.conf: \
+             Permission denied (os error 13)  — needs root"
         );
     }
 

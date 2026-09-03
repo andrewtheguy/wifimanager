@@ -1,6 +1,7 @@
 //! A terminal Wi-Fi manager for NetworkManager, driving its D-Bus API directly.
 
 mod app;
+mod link;
 mod nm;
 mod ui;
 
@@ -31,7 +32,8 @@ usage: wifimanager
 
 Talks to NetworkManager over D-Bus. Takes no options; press ? inside for keys.
 Changing anything (joining, scanning, toggling the radio) goes through polkit,
-so run it from a local login session or as root.";
+so run it from a local login session or as root. Disabling a device also
+writes a drop-in under /etc/NetworkManager/conf.d, which needs root.";
 
 #[tokio::main]
 async fn main() -> Result<()> {

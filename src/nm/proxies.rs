@@ -47,6 +47,9 @@ pub trait Manager {
 
     fn deactivate_connection(&self, active_connection: &ObjectPath<'_>) -> zbus::Result<()>;
 
+    /// `flags` is a bitmask; 1 re-reads the configuration files.
+    fn reload(&self, flags: u32) -> zbus::Result<()>;
+
     #[zbus(property)]
     fn wireless_enabled(&self) -> zbus::Result<bool>;
 

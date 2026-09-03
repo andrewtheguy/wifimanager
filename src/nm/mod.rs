@@ -1,4 +1,5 @@
 pub mod client;
+pub mod conf;
 pub mod proxies;
 pub mod types;
 
