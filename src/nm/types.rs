@@ -544,6 +544,9 @@ pub struct ActiveConnectionInfo {
 pub struct WifiDevice {
     pub path: OwnedObjectPath,
     pub interface: String,
+    /// What the hardware is, from udev's database: "TP-Link Archer T4U ver.3".
+    /// Empty when neither hwdb nor the device itself names it.
+    pub model: String,
     pub driver: String,
     pub driver_version: String,
     pub hw_address: String,
@@ -562,6 +565,16 @@ pub struct WifiDevice {
 }
 
 impl WifiDevice {
+    /// The name to list the device under: the hardware model when udev knows
+    /// it, else the bare interface name.
+    pub fn label(&self) -> String {
+        if self.model.is_empty() {
+            self.interface.clone()
+        } else {
+            self.model.clone()
+        }
+    }
+
     pub fn active_network(&self) -> Option<&Network> {
         self.networks.iter().find(|n| n.active)
     }

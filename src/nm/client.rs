@@ -221,11 +221,13 @@ impl NmClient {
             .flatten()
             .collect();
 
-        let networks = aggregate(aps, active_ap.as_ref(), saved, &d.string("Interface"));
+        let interface = d.string("Interface");
+        let networks = aggregate(aps, active_ap.as_ref(), saved, &interface);
 
         Ok(Some(WifiDevice {
             path: path.clone(),
-            interface: d.string("Interface"),
+            model: device_model(&interface),
+            interface,
             driver: d.string("Driver"),
             driver_version: d.string("DriverVersion"),
             hw_address: d.string("HwAddress"),
@@ -768,9 +770,129 @@ pub fn preferred_saved(network: &Network) -> Option<&SavedConnection> {
         .or_else(|| network.saved.first())
 }
 
+/// NetworkManager reports the driver but not what the card is, so the model
+/// comes from udev: `/run/udev/data/n<ifindex>` is the database record for the
+/// interface, and it carries the hwdb vendor and model names for PCI, USB and
+/// SDIO cards alike — the same source `nmcli` prints as GENERAL.VENDOR and
+/// GENERAL.PRODUCT. A USB dongle hwdb doesn't know still has the strings it
+/// reports itself, in udev's record or, failing that, one level up from the
+/// interface in sysfs. Anything else yields nothing, and the caller falls back
+/// to the interface name.
+fn device_model(interface: &str) -> String {
+    let net = std::path::Path::new("/sys/class/net").join(interface);
+    let read = |path: std::path::PathBuf| {
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    if let Some(index) = read(net.join("ifindex"))
+        && let Some(record) = read(format!("/run/udev/data/n{index}").into())
+    {
+        let model = model_from_udev(&record);
+        if !model.is_empty() {
+            return model;
+        }
+    }
+    let usb = net.join("device").join("..");
+    match (read(usb.join("manufacturer")), read(usb.join("product"))) {
+        (maker, Some(product)) => join_maker(maker.as_deref(), &product),
+        _ => String::new(),
+    }
+}
+
+/// A udev database record is one `E:KEY=value` line per property. The hwdb
+/// names are preferred over the device's own strings, which is also the order
+/// libnm uses.
+fn model_from_udev(record: &str) -> String {
+    let get = |key: &str| {
+        record
+            .lines()
+            .find_map(|line| line.strip_prefix("E:")?.strip_prefix(key)?.strip_prefix('='))
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+    };
+    let maker = get("ID_VENDOR_FROM_DATABASE")
+        .map(str::to_string)
+        .or_else(|| get("ID_VENDOR_ENC").map(unescape));
+    match get("ID_MODEL_FROM_DATABASE")
+        .map(str::to_string)
+        .or_else(|| get("ID_MODEL_ENC").map(unescape))
+    {
+        Some(product) => join_maker(maker.as_deref(), &product),
+        None => String::new(),
+    }
+}
+
+/// udev writes the `_ENC` values with every byte outside plain ASCII as
+/// `\xNN`, spaces included.
+fn unescape(s: &str) -> String {
+    let mut out = Vec::with_capacity(s.len());
+    let mut rest = s.as_bytes();
+    while let Some((&b, tail)) = rest.split_first() {
+        rest = tail;
+        if b == b'\\'
+            && let Some(hex) = rest.strip_prefix(b"x").and_then(|t| t.get(..2))
+            && let Ok(byte) = u8::from_str_radix(std::str::from_utf8(hex).unwrap_or("zz"), 16)
+        {
+            out.push(byte);
+            rest = &rest[3..];
+            continue;
+        }
+        out.push(b);
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// "TP-Link" + "Archer T4U ver.3" reads better joined; "Realtek" +
+/// "Realtek 8812AU" does not.
+fn join_maker(maker: Option<&str>, product: &str) -> String {
+    match maker {
+        Some(maker) if !repeats_maker(maker, product) => format!("{} {product}", brand(maker)),
+        _ => product.to_string(),
+    }
+}
+
+fn repeats_maker(maker: &str, product: &str) -> bool {
+    product.to_lowercase().starts_with(&brand(maker).to_lowercase())
+}
+
+/// The vendor without its corporate tail: "Intel Corporation" → "Intel",
+/// "Broadcom Inc. and subsidiaries" → "Broadcom".
+fn brand(maker: &str) -> &str {
+    let maker = maker.trim();
+    let lower = maker.to_ascii_lowercase();
+    let cut = [" inc", " corp", " co.", " ltd", " gmbh", " llc", " limited", ","]
+        .iter()
+        .filter_map(|marker| lower.find(marker))
+        .min()
+        .unwrap_or(maker.len());
+    maker[..cut].trim()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_model_comes_from_hwdb_when_it_knows_the_card() {
+        let record = "E:ID_VENDOR=Realtek\nE:ID_MODEL_ENC=802.11ac\\x20NIC\nE:ID_VENDOR_FROM_DATABASE=TP-Link\nE:ID_MODEL_FROM_DATABASE=Archer T4U ver.3\n";
+        assert_eq!(model_from_udev(record), "TP-Link Archer T4U ver.3");
+        let record = "E:ID_VENDOR_ID=0x14e4\nE:ID_VENDOR_FROM_DATABASE=Broadcom Inc. and subsidiaries\nE:ID_MODEL_FROM_DATABASE=BCM4331 802.11a/b/g/n (AirPort Extreme)\n";
+        assert_eq!(model_from_udev(record), "Broadcom BCM4331 802.11a/b/g/n (AirPort Extreme)");
+    }
+
+    #[test]
+    fn an_unknown_dongle_falls_back_to_what_it_calls_itself() {
+        let record = "E:ID_VENDOR_ENC=Realtek\nE:ID_MODEL_ENC=802.11ac\\x20NIC\nE:ID_VENDOR_ID=2357\n";
+        assert_eq!(model_from_udev(record), "Realtek 802.11ac NIC");
+        assert_eq!(model_from_udev("E:ID_VENDOR_FROM_DATABASE=Intel Corporation\n"), "");
+        assert_eq!(join_maker(Some("Intel Corporation"), "Wi-Fi 6 AX200"), "Intel Wi-Fi 6 AX200");
+        assert_eq!(join_maker(Some("Realtek"), "Realtek 8812AU"), "Realtek 8812AU");
+        assert_eq!(join_maker(None, "Wireless-N"), "Wireless-N");
+        assert_eq!(brand("Realtek Semiconductor Co., Ltd."), "Realtek Semiconductor");
+        assert_eq!(brand("Qualcomm Atheros"), "Qualcomm Atheros");
+    }
 
     fn ap(path: &str, ssid: &[u8], strength: u8) -> AccessPoint {
         AccessPoint {

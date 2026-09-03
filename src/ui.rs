@@ -217,22 +217,17 @@ fn device_row(d: &WifiDevice) -> ListItem<'static> {
         ),
         Span::raw(" "),
         Span::styled(
-            format!("{:<16}", truncate(&d.interface, 16)),
+            truncate(&d.label(), 30),
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::styled(d.state.to_string(), Style::default().fg(color)),
     ]);
 
-    // Second line: whatever is most useful to know at a glance about this
-    // device without selecting it.
+    // Second line: the interface and state, then whatever is most useful to
+    // know at a glance about this device without selecting it.
     let detail = if let Some(net) = d.active_network() {
-        format!(
-            "{} · {}%",
-            truncate(&display_name(net), 22),
-            net.strength()
-        )
+        format!("{} · {}%", display_name(net), net.strength())
     } else if let Some(a) = &d.active {
-        truncate(&a.id, 30)
+        a.id.clone()
     } else if !d.managed {
         "not managed by NetworkManager".into()
     } else if d.state_reason != 0 {
@@ -243,10 +238,14 @@ fn device_row(d: &WifiDevice) -> ListItem<'static> {
 
     ListItem::new(vec![
         head,
-        Line::from(Span::styled(
-            format!("  {detail}"),
-            Style::default().fg(FG_DIM),
-        )),
+        Line::from(vec![
+            Span::styled(format!("  {} ", d.interface), Style::default().fg(FG_DIM)),
+            Span::styled(d.state.to_string(), Style::default().fg(color)),
+            Span::styled(
+                if detail.is_empty() { String::new() } else { format!(" · {}", truncate(&detail, 22)) },
+                Style::default().fg(FG_DIM),
+            ),
+        ]),
     ])
 }
 
@@ -259,6 +258,9 @@ fn draw_device_detail(frame: &mut Frame, area: Rect, app: &App) {
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(row("interface", &d.interface));
+    if !d.model.is_empty() {
+        lines.push(row("model", &d.model));
+    }
     lines.push(Line::from(vec![
         Span::styled(format!("{:<11}", "state"), Style::default().fg(FG_KEY)),
         Span::styled(d.state.to_string(), Style::default().fg(device_color(d.state))),
@@ -356,7 +358,7 @@ fn draw_device_detail(frame: &mut Frame, area: Rect, app: &App) {
 fn draw_networks(frame: &mut Frame, area: Rect, app: &App) {
     let focused = app.focus == Focus::Networks;
     let title = match app.device() {
-        Some(d) => format!("Networks on {} ({})", d.interface, d.networks.len()),
+        Some(d) => format!("Networks on {} ({})", truncate(&d.label(), 40), d.networks.len()),
         None => "Networks".to_string(),
     };
     let block = panel(title, focused);
