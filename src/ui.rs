@@ -141,11 +141,6 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    // Name the pane Tab moves to, so the arrow keys are never a guess.
-    let tab_hint = match app.focus {
-        Focus::Devices => "tab → networks",
-        Focus::Networks => "tab → devices",
-    };
     let keys: &[(&str, &str)] = &[
         ("↵", "join"),
         ("s", "scan"),
@@ -155,7 +150,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         ("p", "re-key"),
         ("n", "hidden"),
         ("a", "autoconnect"),
-        ("m", "managed"),
+        ("e", "enable/disable"),
         ("q", "quit"),
     ];
     let mut spans = vec![Span::raw(" ")];
@@ -169,10 +164,6 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(FG_DIM),
         ));
     }
-    spans.push(Span::styled(
-        tab_hint.to_string(),
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-    ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -228,8 +219,8 @@ fn device_row(d: &WifiDevice) -> ListItem<'static> {
         format!("{} · {}%", display_name(net), net.strength())
     } else if let Some(a) = &d.active {
         a.id.clone()
-    } else if !d.managed {
-        "not managed by NetworkManager".into()
+    } else if !d.enabled() {
+        "disabled".into()
     } else if d.state_reason != 0 {
         device_state_reason(d.state_reason)
     } else {
@@ -306,7 +297,7 @@ fn draw_device_detail(frame: &mut Frame, area: Rect, app: &App) {
     lines.push(row("driver", &format!("{} {}", d.driver, d.driver_version)));
 
     let mut flags = vec![short_mode(d.mode).to_string()];
-    flags.push(if d.managed { "managed".into() } else { "unmanaged".into() });
+    flags.push(enabled_flag(d).into());
     flags.push(if d.autoconnect {
         "autoconnect".into()
     } else {
@@ -314,6 +305,18 @@ fn draw_device_detail(frame: &mut Frame, area: Rect, app: &App) {
     });
     flags.push(format!("mtu {}", d.mtu));
     lines.push(row("flags", &flags.join(" · ")));
+
+    // A released device keeps whatever addresses it had until the link is
+    // brought back; they are history, not a link, so they are not shown.
+    if !d.enabled() {
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(block)
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+        return;
+    }
 
     if !d.ip4.addresses.is_empty() {
         lines.push(row("ipv4", &d.ip4.addresses.join(", ")));
@@ -353,6 +356,18 @@ fn draw_device_detail(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// The runtime state and whether it survives a reboot, when the two disagree:
+/// a device someone unmanaged with nmcli comes back at the next boot, and one
+/// with a drop-in but no runtime change goes away at it.
+fn enabled_flag(d: &WifiDevice) -> &'static str {
+    match (d.enabled(), d.disabled_by_config) {
+        (true, false) => "enabled",
+        (true, true) => "enabled until reboot",
+        (false, true) => "disabled",
+        (false, false) => "disabled until reboot",
+    }
+}
+
 // -------------------------------------------------------------------- networks
 
 fn draw_networks(frame: &mut Frame, area: Rect, app: &App) {
@@ -368,6 +383,8 @@ fn draw_networks(frame: &mut Frame, area: Rect, app: &App) {
             "loading…"
         } else if !app.snapshot.wireless_enabled {
             "Wi-Fi is off — press w to turn it on"
+        } else if app.device().is_some_and(|d| !d.enabled()) {
+            "this device is disabled — press e to enable it"
         } else {
             "no networks in range — press s to scan"
         };
@@ -596,8 +613,26 @@ fn draw_confirm(frame: &mut Frame, c: &ConfirmKind) {
                 name
             ),
         ),
+        ConfirmKind::Disable { interface, carrying, .. } => (
+            "Disable device",
+            format!(
+                "Disable {interface}?{}\nNetworkManager lets go of it and the link goes down. It stays disabled across reboots until e enables it again.",
+                match carrying {
+                    Some(id) => format!(" It is carrying “{id}”, which another radio may pick up."),
+                    None => String::new(),
+                }
+            ),
+        ),
     };
-    let area = centered(frame.area(), 58, 8);
+    // Border and padding take four columns. The height follows the wrapped
+    // body so a longer warning is never cut off at the bottom; word wrapping
+    // packs a row less tightly than a character count, hence the margin.
+    let (width, packed) = (64u16, 52u16);
+    let body_rows: u16 = body
+        .lines()
+        .map(|l| (l.chars().count() as u16).div_ceil(packed).max(1))
+        .sum();
+    let area = centered(frame.area(), width, body_rows + 5);
     frame.render_widget(Clear, area);
     let mut lines = vec![Line::from("")];
     lines.extend(body.lines().map(|l| Line::from(l.to_string())));
@@ -640,7 +675,7 @@ const HELP: &[(&str, &str)] = &[
     ("s / r", "rescan on the selected device"),
     ("w", "turn the Wi-Fi radio on or off"),
     ("a", "toggle autoconnect on the selected device"),
-    ("m", "toggle NetworkManager management of the device"),
+    ("e", "enable or disable the selected device (persists)"),
     ("", ""),
     ("esc", "dismiss a message or close a dialog"),
     ("q / ctrl-c", "quit"),

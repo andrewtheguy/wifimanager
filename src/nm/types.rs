@@ -554,6 +554,8 @@ pub struct WifiDevice {
     pub state: DeviceState,
     pub state_reason: u32,
     pub managed: bool,
+    /// A wifimanager drop-in keeps this device unmanaged across reboots.
+    pub disabled_by_config: bool,
     pub autoconnect: bool,
     pub mode: ApMode,
     pub bitrate_kbps: u32,
@@ -577,6 +579,12 @@ impl WifiDevice {
 
     pub fn active_network(&self) -> Option<&Network> {
         self.networks.iter().find(|n| n.active)
+    }
+
+    /// Enabled means NetworkManager is driving the device right now; the
+    /// drop-in only says what happens at the next boot.
+    pub fn enabled(&self) -> bool {
+        self.managed
     }
 }
 
